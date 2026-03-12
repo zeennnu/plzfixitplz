@@ -286,7 +286,7 @@ static HAL_StatusTypeDef ds2485_full_ow_sequence(uint8_t delay_steps,
 
   tx[0] = DS2485_CMD_FULL_OW_SEQ;
   tx[1] = (uint8_t)(1U + 8U + ow_data_len);
-  tx[2] = DEFAULT_DELAY_STEPS;
+  tx[2] = delay_steps;
   memcpy(&tx[3], rom_id, 8U);
   memcpy(&tx[11], ow_data, ow_data_len);
 
@@ -517,7 +517,7 @@ static uint8_t app_ds28e18_run_seq(const uint8_t rom[8],
 
   ow_data[0] = DS28E18_CMD_RUN_SEQ;
   ow_data[1] = (uint8_t)(addr & 0xFFU);
-  ow_data[2] = (uint8_t)(((slen & 0xFFU) << 1) | ((addr >> 8) & 0x01U));
+  ow_data[2] = (uint8_t)(((slen & 0x7FU) << 1) | ((addr >> 8) & 0x01U));
   ow_data[3] = (uint8_t)((slen >> 8) & 0x01U);
 
   memset(rx, 0xFF, sizeof(rx));
@@ -560,7 +560,7 @@ static uint8_t app_ds28e18_read_seq(const uint8_t rom[8],
   ow_data[1] = (uint8_t)(addr & 0xFFU);
   ow_data[2] = (uint8_t)(((slen & 0x7FU) << 1) | ((addr >> 8) & 0x01U));
 
-  rx_len = (uint16_t)(2U + 1U + slen);
+  rx_len = (uint16_t)(4U + slen);
 
   memset(rx, 0xFF, sizeof(rx));
   if (ds2485_full_ow_sequence(DEFAULT_DELAY_STEPS, rom, ow_data, sizeof(ow_data), rx, rx_len, 200) != HAL_OK)
@@ -576,6 +576,8 @@ static uint8_t app_ds28e18_read_seq(const uint8_t rom[8],
   uart_write("\r\n");
 
   payload_count = (rx[2] >= 1U) ? (uint8_t)(rx[2] - 1U) : 0U;
+
+  if (payload_count > slen) payload_count = slen;
 
   if ((rx[1] == 0xAAU) && (rx[3] == 0xAAU))
   {
