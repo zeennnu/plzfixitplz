@@ -41,6 +41,7 @@
 #define DS28E18_CMD_RUN_SEQ           0x33U
 #define DS28E18_CMD_DEVICE_STATUS     0x7AU
 #define DS28E18_CMD_WRITE_GPIO_CFG    0x83U
+#define DS2485_CMD_FULL_OW_SEQ        0x67U
 
 #define DS28E18_CFG_TARGET_GPIO_CTRL  0x0BU
 #define DS28E18_CFG_MODULE_GPIO       0x03U
@@ -272,7 +273,7 @@ static HAL_StatusTypeDef ds2485_full_ow_sequence(uint8_t delay_steps,
 
   if ((ow_data_len == 0U) || (ow_data_len > 116U)) return HAL_ERROR;
 
-  tx[0] = DS2485_CMD_FULL_OW_SEQ;
+  tx[0] = 0x67U;
   tx[1] = (uint8_t)(1U + 8U + ow_data_len);
   tx[2] = delay_steps;
   memcpy(&tx[3], rom_id, 8U);
