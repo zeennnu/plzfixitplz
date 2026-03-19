@@ -23,7 +23,7 @@
 #define DS2485_CMD_WRITE_CFG          0x99U
 #define DS2485_CMD_MASTER_RESET       0x62U
 #define DS2485_CMD_1WIRE_BLOCK        0xABU
-#define DS2485_CMD_FULL_OW_SEQ        0x57U
+#define DS2485_CMD_FULL_OW_SEQ        0x67U
 
 #define DS2485_REG_MASTER_CFG         0x00U
 #define DS2485_REG_tRSTL              0x01U
@@ -41,7 +41,7 @@
 #define DS28E18_CMD_RUN_SEQ           0x33U
 #define DS28E18_CMD_DEVICE_STATUS     0x7AU
 #define DS28E18_CMD_WRITE_GPIO_CFG    0x83U
-#define DS2485_CMD_FULL_OW_SEQ        0x67U
+
 
 #define DS28E18_CFG_TARGET_GPIO_CTRL  0x0BU
 #define DS28E18_CFG_MODULE_GPIO       0x03U
@@ -133,6 +133,8 @@ static void test_one_sequence(const uint8_t rom[8],
                               const char *name,
                               const uint8_t *seq,
                               uint8_t seq_len);
+
+static uint8_t ds28e18_poweron_via_skip_rom(void);
 
 /* UART ----------------------------------------------------------------------*/
 static void uart_write(const char *s)
@@ -445,6 +447,66 @@ static uint8_t app_read_rom_retry(uint8_t rom_out[8], uint8_t tries, const char 
   return 0U;
 }
 
+/* DS28E18 power-up init using Skip ROM (0xCC).
+   Must be called before the real ROM ID is known.
+   Per datasheet p.13: issue twice. Ignore result on first call. */
+static uint8_t ds28e18_poweron_via_skip_rom(void)
+{
+  /* 1-Wire payload:
+     [0]    Skip ROM (0xCC)
+     [1]    Command Start (0x66)
+     [2]    Length = 5 (Write GPIO Config cmd + 4 params)
+     [3]    DS28E18_CMD_WRITE_GPIO_CFG (0x83)
+     [4]    DS28E18_CFG_TARGET_GPIO_CTRL (0x0B)
+     [5]    DS28E18_CFG_MODULE_GPIO (0x03)
+     [6]    DS28E18_GPIO_CTRL_HI (0xA5)
+     [7]    DS28E18_GPIO_CTRL_LO (0x0F)
+     [8..9] 0xFF 0xFF  <- CRC16 rx slots (DS28E18 sends these back)
+     [10]   0xAAU      <- Release byte (tells DS28E18 to execute)
+     [11]   0xFF       <- Dummy byte rx slot
+     [12]   0xFF       <- Result length rx slot
+     [13]   0xFF       <- Result byte rx slot
+     [14..15] 0xFF 0xFF <- Result CRC16 rx slots                   */
+
+  uint8_t ow_tx[16] = {
+    0xCCU,                          /* Skip ROM              */
+    0x66U,                          /* Command Start         */
+    0x05U,                          /* Length = 5            */
+    DS28E18_CMD_WRITE_GPIO_CFG,     /* 0x83                  */
+    DS28E18_CFG_TARGET_GPIO_CTRL,   /* 0x0B                  */
+    DS28E18_CFG_MODULE_GPIO,        /* 0x03                  */
+    DS28E18_GPIO_CTRL_HI,           /* 0xA5                  */
+    DS28E18_GPIO_CTRL_LO,           /* 0x0F                  */
+    0xFFU, 0xFFU,                   /* CRC16 rx slots        */
+    0xAAU,                          /* Release byte          */
+    0xFFU,                          /* Dummy byte rx slot    */
+    0xFFU,                          /* Result length rx slot */
+    0xFFU,                          /* Result byte rx slot   */
+    0xFFU, 0xFFU                    /* Result CRC16 rx slots */
+  };
+  uint8_t rx[18];   /* 2 (ds2485 hdr) + 16 (echoed ow_tx) */
+
+  memset(rx, 0xFF, sizeof(rx));
+
+  if (ds2485_1wire_block(OW_BLOCK_FLAG_RESET,
+                         ow_tx, (uint8_t)sizeof(ow_tx),
+                         rx, (uint16_t)sizeof(rx), 400U) != HAL_OK)
+  {
+    uart_write_line("[SKIP] 1-Wire block FAIL");
+    return 0U;
+  }
+
+  /* rx[0]  = DS2485 length byte
+     rx[1]  = DS2485 result (0xAA = OK)
+     rx[2..17] = echoed ow_tx bytes
+     Result byte from DS28E18 is at rx[2 + 13] = rx[15] */
+  uart_write("[SKIP] ds2485=0x"); uart_write_hex8(rx[1]);
+  uart_write(" ds28e18_res=0x"); uart_write_hex8(rx[15]);
+  uart_write("\r\n");
+
+  return (rx[1] == 0xAAU) ? 1U : 0U;
+}
+
 static uint8_t app_ds28e18_write_gpio_cfg(const uint8_t rom[8])
 {
   uint8_t ow_data[5] = {
@@ -582,7 +644,7 @@ static uint8_t app_ds28e18_read_seq(const uint8_t rom[8],
   ow_data[1] = (uint8_t)(addr & 0xFFU);
   ow_data[2] = (uint8_t)(((slen & 0x7FU) << 1) | ((addr >> 8) & 0x01U));
 
-  rx_len = (uint16_t)(2U + 1U + slen);
+  rx_len = (uint16_t)(4U + slen);   // len + ds2485_result + OW_RSLT_LEN + ds28e18_result + data
 
   memset(rx, 0xFF, sizeof(rx));
   if (ds2485_full_ow_sequence(g_fullseq_delay_steps, rom, ow_data,
@@ -749,28 +811,42 @@ int main(void)
 
   uart_write_line("-------");
 
-  if (!app_read_rom_retry(rom, 5U, "[4] READ ROM"))
-  {
-    uart_write_line("[ERR] READ ROM failed");
-    while (1) { HAL_Delay(500); }
-  }
+  /* --- DS28E18 power-up sequence (datasheet p.13) ---
+       On every power-up the ROM reads 56 00 00 00 00 00 00 B2.
+       Two Skip ROM + Write GPIO Config calls load the real ROM ID. */
 
-  if (is_placeholder_rom(rom))
-  {
-    uart_write_line("[INFO] placeholder ROM -> GPIO CONFIG try");
-    if (app_ds28e18_write_gpio_cfg(rom))
+    uart_write_line("[4] DS28E18 power-up init call #1 (result may be invalid)");
+    ds28e18_poweron_via_skip_rom();   /* ignore return - first call is always unreliable */
+    HAL_Delay(10U);
+
+    uart_write_line("[5] DS28E18 power-up init call #2");
+    if (!ds28e18_poweron_via_skip_rom())
     {
-      (void)app_read_rom_retry(rom, 5U, "[5] READ ROM after GPIO");
+      uart_write_line("[ERR] DS28E18 power-up init failed");
+      while (1) { HAL_Delay(500); }
     }
-  }
+    HAL_Delay(10U);
 
-  uart_write_line("[INFO] clear/check POR via DEVICE_STATUS");
-  if (!app_ds28e18_device_status(rom, &ds, &ver, &midl, &midh))
-  {
-    uart_write_line("[ERR] DEVICE_STATUS failed");
-    while (1) { HAL_Delay(500); }
-  }
+    uart_write_line("[6] READ ROM (expecting real unique ID now)");
+    if (!app_read_rom_retry(rom, 5U, "[ROM]"))
+    {
+      uart_write_line("[ERR] READ ROM failed after power-up init");
+      while (1) { HAL_Delay(500); }
+    }
 
+    uart_write("[INFO] using ROM = ");
+    uart_dump_bytes("", rom, 8U);
+
+    uart_write_line("[7] DEVICE_STATUS (clears POR)");
+    if (!app_ds28e18_device_status(rom, &ds, &ver, &midl, &midh))
+    {
+      uart_write_line("[ERR] DEVICE_STATUS failed");
+      while (1) { HAL_Delay(500); }
+    }
+
+    uart_write("[INFO] device status byte = 0x");
+    uart_write_hex8(ds);
+    uart_write("\r\n");
   uart_write("[INFO] device status byte = 0x");
   uart_write_hex8(ds);
   uart_write("\r\n");
